@@ -1,118 +1,103 @@
-import { inngest } from "@/features/inngest/client";
-import { getPullRequestFile } from "./pr-files";
-import { chunkPrFiles } from "../utils/chunk-code";
+import { getServerSession } from "@/features/auth/actions";
+import { DASHBOARD_ROUTES } from "@/features/dashboard/lib/routes";
+import { GithubInstallationStatus } from "@/features/dashboard/lib/types";
+import {getGithubApp} from "@/features/github/utils/github-app"
 import {prisma} from "@/lib/db"
-import { generateReview } from "./generate-review";
-import { postPrComment} from "./post-pr-comment";
- import { buildPrNamespace, saveChunksToPinecone, searchPrContext } from "./vector";
- import { buildRepoNamespace } from "@/features/repo-sync/server/repo-sync";
- 
+import { redirect } from "next/dist/server/api-utils";
 
-
-export const reviewPullRequest= inngest.createFunction(
-    {id: "review-pull-request", triggers:{event:"github/pr.received"}},
-    async ({event,step})=>{
-        const pullRequestId= event.data.pullRequestId;
-
-        // step-1 mark as processing
-
-        const pullRequest= await step.run("mark-processing",async ()=>{
-            return prisma.pullRequest.update({
-                where:{
-                    id:pullRequestId
-                },
-                data:{
-                    status:"processing"
-                }
-            })
-        })
-        // step-2 chunk step
-        const chunks= await step.run("breakdown-code",async()=>{
-            const files=await getPullRequestFile(
-                pullRequest.installationId,
-                pullRequest.repoFullName,
-                pullRequest.prNumber
-            );
-            return chunkPrFiles(pullRequest.prNumber,files)
-        })
-
-        // step -3 chunking
-        if(chunks.length===0){
-            //  stop review here
-            await step.run("mark-reviewed-no-code", async () => {
-                await prisma.pullRequest.update({
-                  where: { id: pullRequestId },
-                  data: { status: "reviewed" },
-                });
-            });
-
-            return {pullRequestId, status: "reviewed", reason: "no code to review"};
-            
-        }
-
-        // PR namespace isolates this diff from other PRs and from repo-wide sync data
-      const namespace = buildPrNamespace(
-        pullRequest.repoFullName,
-        pullRequest.prNumber
-      );
-  
-      await step.run("save-vectors-to-pinecone", async () => {
-        await saveChunksToPinecone(namespace, chunks);
-      });
-        await step.sleep("wait-for-vector-to-index","10s")
-
-         // Extra context from the on-demand codebase sync, when the repo was synced
-      const repoContextSnippets = await step.run("search-repo-context", async () => {
-        const repoSync = await prisma.repoSync.findUnique({
-          where: { repoFullName: pullRequest.repoFullName },
-        });
-  
-        if (!repoSync || repoSync.status !== "synced") {
-          return [];
-        }
-  
-        const repoNamespace = buildRepoNamespace(pullRequest.repoFullName);
-        return searchPrContext(repoNamespace, pullRequest.title);
-      });
-
-      const review = await step.run("generate-ai-review", async () => {
-        // Search within this PR's namespace for chunks related to the PR title
-        const contextSnippets = await searchPrContext(
-          namespace,
-          pullRequest.title
-        );
-  
-        return generateReview({
-          repoFullName: pullRequest.repoFullName,
-          title: pullRequest.title,
-          contextSnippets,
-          repoContextSnippets,
-        });
-      });
-
-        await step.run("post-pr-comment", async ()=>{
-            await postPrComment(
-                pullRequest.installationId,
-                pullRequest.repoFullName,
-                pullRequest.prNumber,
-                review
-            );
-        })
-
-        await step.run("mark-reviewed", async () => {
-            await prisma.pullRequest.update({
-              where: { id: pullRequestId },
-              data: {
-                status: "reviewed",
-                reviewComment: review,
-                reviewedAt: new Date(),
-              },
-            });
-          });
-
-          return {pullRequestId, status:"reviewed"}
+function getAccountLogin(
+    account: {login?: string; slug?: string} |null | undefined
+): string | null {
+    if(!account){
+        return null;
     }
-)
+
+    if("login" in account && account.login){
+        return account.login;
+    }
+
+    if(account.slug){
+        return account.slug;
+    }
+    return null;
+}
+
+function builDisconnectStatus():GithubInstallationStatus{
+    return {connected: false, accountLogin:null, installedAt:null}
+}
+
+export async function getInstallationStatus(userId: string){
+    const installation= await prisma.githubInstallation.findUnique({
+        where:{
+            userId
+        }
+    })
+    if(!installation){
+        return builDisconnectStatus()
+    }
+
+    return {
+        connected: true,
+        accountLogin: installation.accountLogin,
+        installedAt: installation.createdAt.toString()
+    }
+}
+
+export async function saveInstallation(userId:string, installationId: number){
+    const app=getGithubApp();
+    const {data} = await app.octokit.request(
+        "GET /app/installations/{installation_id}",
+        {installation_id:installationId}
+    )
+
+    const accountLogin= getAccountLogin(data.account)
+
+    await prisma.githubInstallation.upsert({
+        where:{userId},
+        create:{
+            userId,
+            installationId,
+            accountLogin,
+            accountType:data.target_type ?? null
+        },
+        update:{
+            installationId,
+            accountLogin,
+            accountType:data.target_type ?? null
+        }
+
+    })
+}
 
 
+export async function deleteInstallation(userId: string){
+    await prisma.githubInstallation.delete(
+        {
+            where: {userId}
+        }
+    )
+}
+
+export async function getUserIdByInstallationId(installationId: number){
+    const installation= await prisma.githubInstallation.findFirst({
+        where:{installationId},
+        select:{userId:true},
+    });
+
+    if(!installation){
+        return null;
+    }
+    return installation.userId;
+}
+
+export async function getUserInstallationId(userId: string){
+    const installation= await prisma.githubInstallation.findUnique({
+        where:{userId},
+        select:{installationId:true},
+    })
+
+    if(!installation) return null;
+
+    return installation.installationId;
+}
 
